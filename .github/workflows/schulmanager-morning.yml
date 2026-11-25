@@ -1,0 +1,52 @@
+name: Schulmanager Morgenbericht
+
+on:
+  schedule:
+    # 05:45 UTC = 06:45 Uhr Winterzeit / 07:45 Uhr Sommerzeit (GitHub-Cron läuft nur in UTC)
+    - cron: "45 5 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      date:
+        description: "Datum (YYYY-MM-DD), leer = heute"
+        required: false
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    env:
+      TZ: Europe/Berlin
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Bericht abrufen
+        env:
+          SCHULMANAGER_EMAIL: ${{ secrets.SCHULMANAGER_EMAIL }}
+          SCHULMANAGER_PASSWORD: ${{ secrets.SCHULMANAGER_PASSWORD }}
+          SCHULMANAGER_STUDENT: ${{ vars.SCHULMANAGER_STUDENT }}
+          REPORT_DATE: ${{ inputs.date }}
+          REPORT_FILE: report.md
+        run: python schulmanager/morning_report.py
+
+      - name: In Job-Zusammenfassung schreiben
+        run: cat report.md >> "$GITHUB_STEP_SUMMARY"
+
+      # Legt pro Tag ein Issue an -> GitHub schickt dir eine Benachrichtigung (App/E-Mail).
+      - name: Als Issue posten
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          title="Schulmanager $(date +%d.%m.%Y)"
+          # ältere Berichte schließen, damit nur der aktuelle offen bleibt
+          for n in $(gh issue list --label schulmanager --state open --json number -q '.[].number'); do
+            gh issue close "$n" --reason completed >/dev/null
+          done
+          gh label create schulmanager --color 1f6feb --force >/dev/null
+          gh issue create --title "$title" --body-file report.md --label schulmanager
