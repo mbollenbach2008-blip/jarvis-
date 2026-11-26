@@ -102,27 +102,42 @@ class Schulmanager:
         raise SchulmanagerError("Anmeldung fehlgeschlagen.\n  " + "\n  ".join(errors))
 
     def _find_bundle_version(self) -> str | None:
-        """Die Web-App schickt eine 'bundleVersion' mit; wir lesen sie aus dem JS-Bundle."""
+        """Die Web-App schickt bei /api/calls eine 'bundleVersion' mit.
+
+        Sie steht in einem der nachgeladenen JS-Chunks (dort, wo 'sendApiRequests'
+        definiert ist). Wir laden ab der Startseite die Chunks, bis wir sie finden.
+        """
         try:
             html = _request(f"{BASE}/").decode("utf-8", "replace")
         except Exception as e:  # noqa: BLE001
             debug(f"Startseite nicht ladbar: {e}")
             return None
-        scripts = re.findall(r'<script[^>]+src="([^"]+\.js)"', html)
-        debug(f"Skripte auf der Startseite: {scripts}")
-        m = re.search(r'bundleVersion["\']?\s*[:=]\s*["\']([0-9a-zA-Z._-]+)["\']', html)
-        if m:
-            return m.group(1)
-        for script in scripts:
-            url = script if script.startswith("http") else f"{BASE}/{script.lstrip('/')}"
-            try:
-                js = _request(url).decode("utf-8", "replace")
-            except Exception as e:  # noqa: BLE001
-                debug(f"{script}: nicht ladbar ({e})")
+        queue = re.findall(r'<script[^>]+src="([^"]+\.js)"', html)
+        seen: set[str] = set()
+        while queue and len(seen) < 300:
+            f = queue.pop(0)
+            if f in seen:
                 continue
-            for hit in re.finditer(r"bundleVersion", js):
-                debug(f"{script}: ...{js[max(0, hit.start()-80):hit.end()+80]}...")
-            m = re.search(r'bundleVersion["\']?\s*[:=]\s*["\']([0-9a-zA-Z._-]+)["\']', js)
+            seen.add(f)
+            try:
+                js = _request(f"{BASE}/{f.lstrip('/')}").decode("utf-8", "replace")
+            except Exception:  # noqa: BLE001
+                continue
+            if "bundleVersion" in js and "/api/calls" in js:
+                version = _extract_bundle_version(js)
+                if version:
+                    return version
+                hit = js.index("bundleVersion")
+                debug(f"bundleVersion in {f} gefunden, Wert unklar: ...{js[max(0, hit-300):hit+100]}...")
+                # Wert könnte aus einem importierten Chunk kommen -> den zuerst prüfen
+                for imp in re.findall(r'from"\./(chunk-[A-Z0-9]+\.js)"', js):
+                    queue.insert(0, f"static/{imp}")
+                continue
+            for c in re.findall(r'["\'](?:\./)?(chunk-[A-Z0-9]+\.js)["\']', js):
+                if f"static/{c}" not in seen:
+                    queue.append(f"static/{c}")
+            m = re.search(r'\bbundleVersion\s*=\s*"([^"]+)"', js) or \
+                re.search(r'["\']?bundleVersion["\']?\s*:\s*"([^"]+)"', js)
             if m:
                 return m.group(1)
         return None
@@ -156,6 +171,19 @@ class Schulmanager:
         if r.get("status", 200) != 200:
             raise SchulmanagerError(f"{module}/{endpoint}: Status {r.get('status')}")
         return r.get("data")
+
+
+def _extract_bundle_version(js: str) -> str | None:
+    """Liest den Wert der Variable aus, die in '{bundleVersion:x,requests:...}' steht."""
+    m = re.search(r'bundleVersion\s*:\s*"([^"]+)"', js)
+    if m:
+        return m.group(1)
+    m = re.search(r'bundleVersion\s*:\s*([A-Za-z_$][\w$]*)', js)
+    if not m:
+        return None
+    var = re.escape(m.group(1))
+    m = re.search(r'(?<![\w$.])' + var + r'\s*=\s*["\']([^"\']+)["\']', js)
+    return m.group(1) if m else None
 
 
 # --- Formatierung --------------------------------------------------------------
