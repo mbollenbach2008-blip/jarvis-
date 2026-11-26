@@ -19,6 +19,7 @@ Nur Standardbibliothek – keine Abhängigkeiten nötig.
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import os
 import re
@@ -29,6 +30,11 @@ import urllib.request
 BASE = "https://login.schulmanager-online.de"
 UA = "Mozilla/5.0 (X11; Linux x86_64) jarvis-morning-report"
 WEEKDAYS = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"]
+
+
+def debug(msg: str) -> None:
+    """Technische Hinweise ins Log (keine Schuldaten)."""
+    print(f"[debug] {msg}", file=sys.stderr)
 
 
 class SchulmanagerError(RuntimeError):
@@ -61,29 +67,79 @@ class Schulmanager:
 
     # --- Anmeldung ---------------------------------------------------------
     def login(self) -> None:
-        raw = _request(
-            f"{BASE}/api/login",
-            {"emailOrUsername": self.email, "password": self.password,
-             "mobileApp": False, "institutionId": None},
-        )
-        data = json.loads(raw)
-        if not data.get("jwt"):
-            raise SchulmanagerError("Anmeldung fehlgeschlagen – Zugangsdaten prüfen.")
-        self.token = data["jwt"]
-        self.user = data.get("user") or {}
-        self.bundle_version = self._find_bundle_version()
+        base = {"emailOrUsername": self.email, "mobileApp": False, "institutionId": None}
+        attempts = []
+        # Neuere Web-App: erst "Salz" holen, Passwort per PBKDF2 hashen und mitschicken.
+        try:
+            salt = json.loads(_request(f"{BASE}/api/get-salt", base))
+            if isinstance(salt, dict):
+                salt = salt.get("salt")
+            if salt:
+                pw_hash = hashlib.pbkdf2_hmac("sha512", self.password.encode(),
+                                              str(salt).encode(), 99999, 512).hex()
+                attempts.append(("mit Hash", {**base, "password": self.password, "hash": pw_hash}))
+        except Exception as e:  # noqa: BLE001
+            print(f"Hinweis: get-salt nicht verfügbar ({e})", file=sys.stderr)
+        # Ältere Variante: Passwort direkt.
+        attempts.append(("direkt", {**base, "password": self.password}))
+
+        errors = []
+        for name, payload in attempts:
+            try:
+                data = json.loads(_request(f"{BASE}/api/login", payload))
+            except SchulmanagerError as e:
+                errors.append(f"{name}: {e}")
+                continue
+            if data.get("jwt"):
+                print(f"Anmeldung erfolgreich ({name}).", file=sys.stderr)
+                self.token = data["jwt"]
+                self.user = data.get("user") or {}
+                self.bundle_version = self._find_bundle_version()
+                debug(f"bundleVersion: {self.bundle_version!r}")
+                debug(f"Felder im Benutzerprofil: {sorted(self.user)}")
+                return
+            errors.append(f"{name}: keine Sitzung erhalten, Antwortfelder: {sorted(data)}")
+        raise SchulmanagerError("Anmeldung fehlgeschlagen.\n  " + "\n  ".join(errors))
 
     def _find_bundle_version(self) -> str | None:
-        """Die Web-App schickt eine 'bundleVersion' mit; wir lesen sie aus dem JS-Bundle."""
+        """Die Web-App schickt bei /api/calls eine 'bundleVersion' mit.
+
+        Sie steht in einem der nachgeladenen JS-Chunks (dort, wo 'sendApiRequests'
+        definiert ist). Wir laden ab der Startseite die Chunks, bis wir sie finden.
+        """
         try:
             html = _request(f"{BASE}/").decode("utf-8", "replace")
-            for script in re.findall(r'src="([^"]*main[^"]*\.js)"', html):
-                js = _request(f"{BASE}/{script.lstrip('/')}").decode("utf-8", "replace")
-                m = re.search(r'bundleVersion\s*[:=]\s*["\']([0-9a-zA-Z._-]+)["\']', js)
-                if m:
-                    return m.group(1)
-        except Exception:  # noqa: BLE001 – optional, Server akzeptiert meist auch ohne
-            pass
+        except Exception as e:  # noqa: BLE001
+            debug(f"Startseite nicht ladbar: {e}")
+            return None
+        queue = re.findall(r'<script[^>]+src="([^"]+\.js)"', html)
+        seen: set[str] = set()
+        while queue and len(seen) < 300:
+            f = queue.pop(0)
+            if f in seen:
+                continue
+            seen.add(f)
+            try:
+                js = _request(f"{BASE}/{f.lstrip('/')}").decode("utf-8", "replace")
+            except Exception:  # noqa: BLE001
+                continue
+            if "bundleVersion" in js and "/api/calls" in js:
+                version = _extract_bundle_version(js)
+                if version:
+                    return version
+                hit = js.index("bundleVersion")
+                debug(f"bundleVersion in {f} gefunden, Wert unklar: ...{js[max(0, hit-300):hit+100]}...")
+                # Wert könnte aus einem importierten Chunk kommen -> den zuerst prüfen
+                for imp in re.findall(r'from"\./(chunk-[A-Z0-9]+\.js)"', js):
+                    queue.insert(0, f"static/{imp}")
+                continue
+            for c in re.findall(r'["\'](?:\./)?(chunk-[A-Z0-9]+\.js)["\']', js):
+                if f"static/{c}" not in seen:
+                    queue.append(f"static/{c}")
+            m = re.search(r'\bbundleVersion\s*=\s*"([^"]+)"', js) or \
+                re.search(r'["\']?bundleVersion["\']?\s*:\s*"([^"]+)"', js)
+            if m:
+                return m.group(1)
         return None
 
     # --- Schüler ermitteln ---------------------------------------------------
@@ -115,6 +171,19 @@ class Schulmanager:
         if r.get("status", 200) != 200:
             raise SchulmanagerError(f"{module}/{endpoint}: Status {r.get('status')}")
         return r.get("data")
+
+
+def _extract_bundle_version(js: str) -> str | None:
+    """Liest den Wert der Variable aus, die in '{bundleVersion:x,requests:...}' steht."""
+    m = re.search(r'bundleVersion\s*:\s*"([^"]+)"', js)
+    if m:
+        return m.group(1)
+    m = re.search(r'bundleVersion\s*:\s*([A-Za-z_$][\w$]*)', js)
+    if not m:
+        return None
+    var = re.escape(m.group(1))
+    m = re.search(r'(?<![\w$.])' + var + r'\s*=\s*["\']([^"\']+)["\']', js)
+    return m.group(1) if m else None
 
 
 # --- Formatierung --------------------------------------------------------------
@@ -155,7 +224,8 @@ def format_lessons(lessons: list[dict], day: dt.date) -> list[str]:
         ltype = l.get("type") or ""
         if ltype and ltype not in ("regularLesson",):
             notes.append({"cancelledLesson": "❌ Entfall", "changedLesson": "🔄 Vertretung",
-                          "additionalLesson": "➕ Zusatzstunde", "event": "📅 Termin"}
+                          "additionalLesson": "➕ Zusatzstunde", "event": "📅 Termin",
+                          "specialLesson": "⭐ Sonderstunde"}
                          .get(ltype, ltype))
         if original and ltype not in ("regularLesson", "cancelledLesson"):
             o = original[0]
@@ -168,6 +238,7 @@ def format_lessons(lessons: list[dict], day: dt.date) -> list[str]:
             notes.append(l["comment"])
         if ltype == "cancelledLesson" and not subject and original:
             subject = (original[0].get("subject") or {}).get("abbreviation") or ""
+        notes = list(dict.fromkeys(n for n in notes if n))  # doppelte Hinweise entfernen
         lines.append(f"| {hour} | {subject} | {teacher} | {room} | {' · '.join(notes)} |")
     return lines
 
@@ -260,15 +331,19 @@ def build_report(sm: Schulmanager, day: dt.date, wanted: str | None) -> str:
 
 
 def main() -> int:
-    email = os.environ.get("SCHULMANAGER_EMAIL")
-    password = os.environ.get("SCHULMANAGER_PASSWORD")
+    email = (os.environ.get("SCHULMANAGER_EMAIL") or "").strip()
+    password = (os.environ.get("SCHULMANAGER_PASSWORD") or "").strip("\r\n")
     if not email or not password:
         print("SCHULMANAGER_EMAIL und SCHULMANAGER_PASSWORD müssen gesetzt sein.", file=sys.stderr)
         return 2
     day = dt.date.fromisoformat(os.environ["REPORT_DATE"]) if os.environ.get("REPORT_DATE") else dt.date.today()
 
     sm = Schulmanager(email, password)
-    sm.login()
+    try:
+        sm.login()
+    except SchulmanagerError as e:
+        print(f"FEHLER: {e}", file=sys.stderr)
+        return 1
     report = build_report(sm, day, os.environ.get("SCHULMANAGER_STUDENT"))
     print(report)
 
