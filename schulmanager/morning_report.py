@@ -19,6 +19,7 @@ Nur Standardbibliothek – keine Abhängigkeiten nötig.
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import os
 import re
@@ -61,17 +62,37 @@ class Schulmanager:
 
     # --- Anmeldung ---------------------------------------------------------
     def login(self) -> None:
-        raw = _request(
-            f"{BASE}/api/login",
-            {"emailOrUsername": self.email, "password": self.password,
-             "mobileApp": False, "institutionId": None},
-        )
-        data = json.loads(raw)
-        if not data.get("jwt"):
-            raise SchulmanagerError("Anmeldung fehlgeschlagen – Zugangsdaten prüfen.")
-        self.token = data["jwt"]
-        self.user = data.get("user") or {}
-        self.bundle_version = self._find_bundle_version()
+        base = {"emailOrUsername": self.email, "mobileApp": False, "institutionId": None}
+        attempts = []
+        # Neuere Web-App: erst "Salz" holen, Passwort per PBKDF2 hashen und mitschicken.
+        try:
+            salt = json.loads(_request(f"{BASE}/api/get-salt", base))
+            if isinstance(salt, dict):
+                salt = salt.get("salt")
+            if salt:
+                pw_hash = hashlib.pbkdf2_hmac("sha512", self.password.encode(),
+                                              str(salt).encode(), 99999, 512).hex()
+                attempts.append(("mit Hash", {**base, "password": self.password, "hash": pw_hash}))
+        except Exception as e:  # noqa: BLE001
+            print(f"Hinweis: get-salt nicht verfügbar ({e})", file=sys.stderr)
+        # Ältere Variante: Passwort direkt.
+        attempts.append(("direkt", {**base, "password": self.password}))
+
+        errors = []
+        for name, payload in attempts:
+            try:
+                data = json.loads(_request(f"{BASE}/api/login", payload))
+            except SchulmanagerError as e:
+                errors.append(f"{name}: {e}")
+                continue
+            if data.get("jwt"):
+                print(f"Anmeldung erfolgreich ({name}).", file=sys.stderr)
+                self.token = data["jwt"]
+                self.user = data.get("user") or {}
+                self.bundle_version = self._find_bundle_version()
+                return
+            errors.append(f"{name}: keine Sitzung erhalten, Antwortfelder: {sorted(data)}")
+        raise SchulmanagerError("Anmeldung fehlgeschlagen.\n  " + "\n  ".join(errors))
 
     def _find_bundle_version(self) -> str | None:
         """Die Web-App schickt eine 'bundleVersion' mit; wir lesen sie aus dem JS-Bundle."""
@@ -260,15 +281,19 @@ def build_report(sm: Schulmanager, day: dt.date, wanted: str | None) -> str:
 
 
 def main() -> int:
-    email = os.environ.get("SCHULMANAGER_EMAIL")
-    password = os.environ.get("SCHULMANAGER_PASSWORD")
+    email = (os.environ.get("SCHULMANAGER_EMAIL") or "").strip()
+    password = (os.environ.get("SCHULMANAGER_PASSWORD") or "").strip("\r\n")
     if not email or not password:
         print("SCHULMANAGER_EMAIL und SCHULMANAGER_PASSWORD müssen gesetzt sein.", file=sys.stderr)
         return 2
     day = dt.date.fromisoformat(os.environ["REPORT_DATE"]) if os.environ.get("REPORT_DATE") else dt.date.today()
 
     sm = Schulmanager(email, password)
-    sm.login()
+    try:
+        sm.login()
+    except SchulmanagerError as e:
+        print(f"FEHLER: {e}", file=sys.stderr)
+        return 1
     report = build_report(sm, day, os.environ.get("SCHULMANAGER_STUDENT"))
     print(report)
 
