@@ -6,9 +6,9 @@ def get(u):
 html = get(BASE + "/")
 files = re.findall(r'src="([^"]+\.js)"', html)
 seen = set()
-patterns = ["api/calls", "moduleName", "endpointName", "bundleVersion", "get-actual-lessons", "get-homework", "get-letters", "get-exams", "requests:"]
+patterns = ["/calls", "endpoint", "bundleVersion", "\"api/", "/api/", "get-actual-lessons", "get-letters", "requests:", "getForModule=function", "getForModule(t){", "Authorization"]
 queue = list(files)
-while queue and len(seen) < 60:
+while queue and len(seen) < 250:
     f = queue.pop(0)
     if f in seen: continue
     seen.add(f)
@@ -19,6 +19,6 @@ while queue and len(seen) < 60:
         if c not in seen: queue.append(c)
     for p in patterns:
         for i, m in enumerate(re.finditer(re.escape(p), js)):
-            if i >= 3: break
+            if i >= 2: break
             print(f"== {f} [{p}] ..." + js[max(0, m.start()-200):m.end()+200].replace("\n", " ") + "...")
 print("Dateien:", len(seen))
