@@ -26,6 +26,9 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Diagnose (temporär)
+        run: python schulmanager/inspect_bundle.py || true
+
       - name: Bericht abrufen
         env:
           SCHULMANAGER_EMAIL: ${{ secrets.SCHULMANAGER_EMAIL }}
