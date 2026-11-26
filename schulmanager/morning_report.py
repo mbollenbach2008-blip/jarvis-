@@ -32,6 +32,11 @@ UA = "Mozilla/5.0 (X11; Linux x86_64) jarvis-morning-report"
 WEEKDAYS = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"]
 
 
+def debug(msg: str) -> None:
+    """Technische Hinweise ins Log (keine Schuldaten)."""
+    print(f"[debug] {msg}", file=sys.stderr)
+
+
 class SchulmanagerError(RuntimeError):
     pass
 
@@ -90,6 +95,8 @@ class Schulmanager:
                 self.token = data["jwt"]
                 self.user = data.get("user") or {}
                 self.bundle_version = self._find_bundle_version()
+                debug(f"bundleVersion: {self.bundle_version!r}")
+                debug(f"Felder im Benutzerprofil: {sorted(self.user)}")
                 return
             errors.append(f"{name}: keine Sitzung erhalten, Antwortfelder: {sorted(data)}")
         raise SchulmanagerError("Anmeldung fehlgeschlagen.\n  " + "\n  ".join(errors))
@@ -98,13 +105,26 @@ class Schulmanager:
         """Die Web-App schickt eine 'bundleVersion' mit; wir lesen sie aus dem JS-Bundle."""
         try:
             html = _request(f"{BASE}/").decode("utf-8", "replace")
-            for script in re.findall(r'src="([^"]*main[^"]*\.js)"', html):
-                js = _request(f"{BASE}/{script.lstrip('/')}").decode("utf-8", "replace")
-                m = re.search(r'bundleVersion\s*[:=]\s*["\']([0-9a-zA-Z._-]+)["\']', js)
-                if m:
-                    return m.group(1)
-        except Exception:  # noqa: BLE001 – optional, Server akzeptiert meist auch ohne
-            pass
+        except Exception as e:  # noqa: BLE001
+            debug(f"Startseite nicht ladbar: {e}")
+            return None
+        scripts = re.findall(r'<script[^>]+src="([^"]+\.js)"', html)
+        debug(f"Skripte auf der Startseite: {scripts}")
+        m = re.search(r'bundleVersion["\']?\s*[:=]\s*["\']([0-9a-zA-Z._-]+)["\']', html)
+        if m:
+            return m.group(1)
+        for script in scripts:
+            url = script if script.startswith("http") else f"{BASE}/{script.lstrip('/')}"
+            try:
+                js = _request(url).decode("utf-8", "replace")
+            except Exception as e:  # noqa: BLE001
+                debug(f"{script}: nicht ladbar ({e})")
+                continue
+            for hit in re.finditer(r"bundleVersion", js):
+                debug(f"{script}: ...{js[max(0, hit.start()-80):hit.end()+80]}...")
+            m = re.search(r'bundleVersion["\']?\s*[:=]\s*["\']([0-9a-zA-Z._-]+)["\']', js)
+            if m:
+                return m.group(1)
         return None
 
     # --- Schüler ermitteln ---------------------------------------------------
