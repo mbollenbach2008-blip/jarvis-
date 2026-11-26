@@ -224,7 +224,8 @@ def format_lessons(lessons: list[dict], day: dt.date) -> list[str]:
         ltype = l.get("type") or ""
         if ltype and ltype not in ("regularLesson",):
             notes.append({"cancelledLesson": "❌ Entfall", "changedLesson": "🔄 Vertretung",
-                          "additionalLesson": "➕ Zusatzstunde", "event": "📅 Termin"}
+                          "additionalLesson": "➕ Zusatzstunde", "event": "📅 Termin",
+                          "specialLesson": "⭐ Sonderstunde"}
                          .get(ltype, ltype))
         if original and ltype not in ("regularLesson", "cancelledLesson"):
             o = original[0]
@@ -237,6 +238,7 @@ def format_lessons(lessons: list[dict], day: dt.date) -> list[str]:
             notes.append(l["comment"])
         if ltype == "cancelledLesson" and not subject and original:
             subject = (original[0].get("subject") or {}).get("abbreviation") or ""
+        notes = list(dict.fromkeys(n for n in notes if n))  # doppelte Hinweise entfernen
         lines.append(f"| {hour} | {subject} | {teacher} | {room} | {' · '.join(notes)} |")
     return lines
 
